@@ -1,0 +1,558 @@
+
+---
+title: "S547 Final Project"
+author: "Zhiling GU"
+date: "`r Sys.Date()`"
+output:
+rmarkdown::html_vignette:
+  keep_tex: yes
+  fig_caption: yes
+# output:
+#   pdf_document:
+#     keep_tex: yes
+    
+vignette: >
+  %\VignetteIndexEntry{Vignette Title}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r echo=FALSE}
+## Preparation 
+library(fdapace)
+library(dplyr)
+library(locfit)
+library(fda)
+library(fdapace)
+library(refund)
+?pfr
+
+library(plotly)
+library(ggplot2)
+library(rgl)
+# if (!require("processx")) install.packages("processx")
+library(processx)
+
+load("smoothed.RData") 
+```
+
+```{r, echo = FALSE }
+## read.dly function 
+## https://github.com/cran/VFS/blob/master/R/read.dly.R
+
+read.dly <-
+function(filename) {
+
+
+    is.leapyear <- function(year) {
+        # https://www.r-bloggers.com/leap-years/
+        # http://en.wikipedia.org/wiki/Leap_year
+        ((year %% 4 == 0) & (year %% 100 != 0)) | (year %% 400 == 0)
+    }
+
+    # import GHCN daily weather data
+    # https://www1.ncdc.noaa.gov/pub/data/ghcn/daily/readme.txt
+
+    x <- utils::read.fwf(filename, widths=c(11, 4, 2, 4, rep(c(5, 1, 1, 1), 31)), header=FALSE, stringsAsFactors=FALSE)
+    colnames(x) <- c("ID", "YEAR", "MONTH", "ELEMENT", paste0(c("VALUE", "MFLAG", "QFLAG", "SFLAG"), rep(1:31, each=4)))
+    x[x == -9999] <- NA
+
+    # fill in missing months
+    yrmo <- expand.grid(MONTH = seq(1, 12), YEAR = seq(min(x$YEAR), max(x$YEAR)))[, c(2, 1)]
+    yrmody <- yrmo[rep(1:nrow(yrmo), each=31),]
+    yrmody$DAY <- rep(1:31, times=nrow(yrmo))
+
+    # all should have these five elements, and maybe more
+    # PRCP = Precipitation (tenths of mm)
+    # SNOW = Snowfall (mm)
+    # SNWD = Snow depth (mm)
+    # TMAX = Maximum temperature (tenths of degrees C)
+    # TMIN = Minimum temperature (tenths of degrees C)
+
+    el.core <- c("PRCP", "SNOW", "SNWD", "TMAX", "TMIN")
+    el.other <- sort(unique(x$ELEMENT))
+    el.other <- el.other[!(el.other %in% el.core)]
+    el.all <- c(el.core, el.other)
+
+    results <- vector(length(el.all), mode="list")
+    names(results) <- el.all
+
+    for(i in seq_along(el.all)) {
+        thisset <- subset(x, x$ELEMENT == el.all[i])
+        thisset <- merge(yrmo, thisset, all.x=TRUE)
+        thisset <- thisset[order(thisset$YEAR, thisset$MONTH), ]
+
+        tsvalue <- as.vector(t(as.matrix(thisset[, grepl("VALUE", colnames(thisset))])))
+        tsmflag <- as.vector(t(as.matrix(thisset[, grepl("MFLAG", colnames(thisset))])))
+        tsqflag <- as.vector(t(as.matrix(thisset[, grepl("QFLAG", colnames(thisset))])))
+        tssflag <- as.vector(t(as.matrix(thisset[, grepl("SFLAG", colnames(thisset))])))
+
+        tsvalue[grepl(" ", tsvalue)] <- NA
+        tsmflag[grepl(" ", tsmflag)] <- NA
+        tsqflag[grepl(" ", tsqflag)] <- NA
+        tssflag[grepl(" ", tssflag)] <- NA
+
+        thisset <- data.frame(VALUE=tsvalue, MFLAG=tsmflag, QFLAG=tsqflag, SFLAG=tssflag, stringsAsFactors=FALSE)
+
+        results[[i]] <- thisset
+    }
+
+    results <- do.call("data.frame", list(results, stringsAsFactors=FALSE))
+    results <- data.frame(yrmody, results, stringsAsFactors=FALSE)
+
+    # have 12 31-day months. This is not good.
+    # can get rid of some of the days automatically
+    results <- subset(results, !(results$MONTH == 2 & results$DAY > 28))
+    results <- subset(results, !(results$MONTH ==  4 & results$DAY > 30))
+    results <- subset(results, !(results$MONTH ==  6 & results$DAY > 30))
+    results <- subset(results, !(results$MONTH ==  9 & results$DAY > 30))
+    results <- subset(results, !(results$MONTH == 11 & results$DAY > 30))
+    # results <- subset(results, !(!is.leapyear(results$YEAR) & results$MONTH == 2 & results$DAY > 28))
+    
+    
+
+    # correct units: mm for PRCP, C for TMAX, TMIN
+    results$PRCP.VALUE <- results$PRCP.VALUE/10
+    results$TMAX.VALUE <- results$TMAX.VALUE/10
+    results$TMIN.VALUE <- results$TMIN.VALUE/10
+    results$SPREAD <-   results$TMAX.VALUE-results$TMIN.VALUE
+    results
+}
+
+
+```
+
+
+
+
+```{r dataImport,  eval = FALSE}
+
+# #assuming tab separated values with a header
+# filelist <- list.files(pattern = ".*.dly")
+# datalist <- lapply(filelist, function(x)read.dly(x))
+
+# Read Multiple dly files
+loclist <- c("Redwood", "Davis", "Ames")
+tickerlist <- c( "TMIN.VALUE", "TMAX.VALUE", "SPREAD")
+for (loc in loclist){
+  exec <- paste0("dat.", loc, " <- read.dly(\"", paste0(loc, ".dly\""), ")")
+  eval(parse(text = exec))
+}
+
+for(loc in loclist){
+    eval(parse(text = paste0("dat <- dat." ,loc)))
+    dat <- subset(dat,YEAR!= 2019) # do not consider the latest year, due to missing data for the rest of the year
+    dates <- data.frame(y  = dat$YEAR, m = dat$MONTH, d = dat$DAY)
+    dat$dates <- dates
+    ndays <- nrow(subset(dat$dates, dates$y == y[1])) #365 for each year
+    days <- rep(seq(ndays), length(unique(dat$YEAR) )) 
+    dat$days <- days
+    
+    for(ticker in tickerlist){
+        # summary(dat)
+        df <- data.frame(t = days, id = dat$YEAR, y =dat[[ticker]]) # %>% na.omit 
+        df$no <- 1:nrow(df)
+        denseSamp <- MakeFPCAInputs(IDs=as.vector(df$id), tVec=df$t, yVec=df$y) 
+        eval(parse(text = paste0("df.",loc, ".",ticker,"<- df") ) )
+        eval(parse(text = paste0("denseSamp.",loc, ".",ticker,"<- denseSamp") ) )
+    }
+}
+```
+
+```{r, Preliminary}
+ylim <- c(-10,40) 
+par(mfrow = c(1,2))
+## Some preliminary data analysis
+#### A peak of original data
+ticker <- "TMAX.VALUE"
+loc <- "Davis"
+for( loc in loclist){
+  for( ticker in tickerlist){
+    eval(parse(text = paste0("df <- df.",loc, ".",ticker) ))
+    plot(y ~ t , df , type = "p", lty = 1, ylim = ylim, main = paste0("Averaged daily ", ticker,  " of ", loc))
+    
+    
+    #### See which days have same observation for as the previous day
+    diff <- abs(df$y[-1]  - df$y[1:(nrow(df)-1)])
+    strangeInd <- which( diff <.001)
+    cbind(df$y[strangeInd],df$y[strangeInd+1])
+    table(df$id[strangeInd])
+    
+    #### A peak of averaged daily max temperature
+    mu.max <- matrix(df$y, ncol = ndays, byrow = TRUE) %>% colMeans(na.rm = TRUE)
+    lines(mu.max~ seq(ndays), type = "l", col = 2)
+  }
+}  
+```
+
+#### Mean function
+
+```{r}
+## Mean estimation
+#### Smoothing using Epanechnikov Kernel
+hmu  <- 49
+ngrid <- 365
+col <- 1: length(loclist)
+ylim <- c(0,40) 
+
+png("pre-smooth.png",width = 2000, height = 1000, units = "px", pointsize = 30)
+par(mfrow = c(1,3))
+for( ticker in tickerlist){
+    for( loc in loclist){
+    eval(parse(text = paste0("df <- df.",loc, ".",ticker) ))
+    df <- df %>% na.omit 
+    resMu <- locfit (y ~ lp (t, h  = hmu, deg = 3 ), df, ev = lfgrid(mg = ngrid), kern = 'epan')
+    tGrid <-  seq(min(df$t), max(df$t), length.out = ngrid)
+    muHat <- predict (resMu)
+    if(loc == loclist[1])
+      plot(tGrid, muHat, col = 1, lwd = 2, lty = 1, ylim = ylim, type = "l",xlab = "days", ylab = paste0("Smoothed daily  ", ticker))  # main = paste0("The smoothed estimation of Mean Daily ", ticker)
+   else
+      lines(tGrid, muHat, col = 2, lwd = 2, lty = 2, ylim = ylim, xlab = "days", ylab = "Smoothed daily mean")
+    }
+  legend("topleft",loclist, lty = 1:length(loclist) , lwd = 2 , col = 1:2)
+}
+dev.off()
+
+
+
+```
+
+
+
+
+
+
+```{r}
+## Covariance & FPCs Estimation
+hmu  <- 49
+ngrid <- 365
+col <- 1: length(loclist)
+ylim <- c(0,40) 
+## Dataframe stacking
+#### Note the time for y_2 is shifted, otherwise error of duplicate time t would occur
+#### Also note the shift in time t would not affect the estimation of mean function, covariance function or eigen function. 
+#### It would only affect the FPC scores.
+df1 <- df.Davis.TMIN.VALUE %>% na.omit()
+df2 <- df.Davis.TMAX.VALUE %>% na.omit()
+#### Data Manipulation: truncated log transform (since there are temperature zero observations)
+# df1$y <- log(df1$y + .001) 
+# df2$y <- log(df2$y + .001) 
+df2$t <- df2$t+diff(range(df2$t))+1
+df.min.max <- rbind(df1, df2)%>% na.omit()
+df <- df.min.max
+resMu <- locfit(y ~ lp(t, deg=1), df, ev=lfgrid(mg=ngrid)) 
+tGrid <- seq(min(df$t), max(df$t), length.out=ngrid)  # working grid
+samp <- MakeFPCAInputs(df$id, df$t, df$y) 
+res <- FPCA(samp$Ly, samp$Lt, list(userBwMu=hmu, userBwCov=hmu, FVEthreshold=1, dataType  = 'Dense')) 
+# plot(res) 
+matplot (res$phi[,1:3], type = "l", main = "First 3 PCs without Pre-smoothing")
+plot(res$cumFVE, type = "l", xlab = "Number of PCs" , ylab ="Variance explained", main = "Variance explained without Pre-smoothing")
+x1 =1:ndays
+x2 = (ndays+1):(2*ndays)
+cov = res$fittedCov[x1,x2]
+persp(x =1:ndays , y = 1:ndays,  z = res$fittedCov[x1,x2])
+
+plotdf <-list(x1 =1:ndays , x2 = 1:ndays,  cov = res$fittedCov[x1,x2])
+# plotdf <-data.frame(res$fittedCov)
+# qplot(plotdf, aes(x1= x1, x2 = x2 )) + geom_line() + facet_wrap(~K, scales='free_y')
+
+p <- plot_ly(z = ~plotdf$cov, x=~plotdf$x1,  y=~plotdf$x1) %>% add_surface()
+p  <- layout(p,              
+                title = paste0("Covariance estimation for ", loc, ticker),
+                scene = list(xaxis = list(title = 't'),
+                    yaxis = list(title = 's'),
+                    zaxis = list(title = 'cov(t,s)', range = c(-1,8))))
+
+p
+```
+
+The roughness of the mean function and covariance function stem from the noise in the original data. The paper proposed to smooth the origianl data to deal with this problem. 
+
+In addition, to alleviate the roughness on the edges between each segment, the author smoothed the data with extended  segments at each ends of the segment, and evaluate only on the support of each segment. That means, the data of the first and last observations of each segment is used twice to provide information of the edge behaviour between two consective segments. The size of the overlapped segment is proposed to be $2bq$ where $b$ is the bandwidth 
+
+
+## Smoothing of original temperature curve
+
+Note splitting the dataframe is needed since two large dataframe can drive computational issue. 
+
+```{r, eval = FALSE}
+#### WARNING: This chunk takes a long time  (~2 min)
+
+## OverlapSplit 
+## https://stackoverflow.com/questions/5653756/split-a-data-frame-into-overlapping-dataframes
+OverlapSplit <- function(x,nsplit=1,overlap=2){
+    nrows <- NROW(x)
+    nperdf <- ceiling( (nrows + overlap*nsplit) / (nsplit+1) )
+    start <- seq(1, nsplit*(nperdf-overlap)+1, by= nperdf-overlap )
+    fullind <- lapply(start, function(i) c(i:(i+nperdf-1)))
+    if( start[nsplit+1] + nperdf != nrows )
+        warning("Returning an incomplete dataframe.")
+    splitted <- lapply(start, function(i) x[c(i:(i+nperdf-1)),])
+    return(list(splitted  =splitted , start = start, fullind = fullind ))
+}
+
+
+ticker <- tickerlist[1] #"TMAX.VALUE"
+loc <- loclist[1]# "Davis"
+nsplit <- 4
+nseg <- nsplit + 1
+hmu <- 49
+
+for( loc in loclist){
+  for( ticker in tickerlist){
+    
+  eval(parse(text = paste0("df <- df.",loc, ".",ticker) ))
+  df.split <-OverlapSplit(df, nsplit = nsplit, overlap = 2* hmu * nseg)
+  fullind <- df.split$fullind
+  smoothed <- c()
+   
+    for( i in 1: nseg){
+      # i = 1
+      # i = nseg
+      df.i <- df.split$splitted[[i]]
+      nrow <- nrow(df.i)
+      if( i == 1 ){
+        evaind <- 1:(nrow - hmu * nseg)
+      }else
+      if(i == nseg){
+        evaind <- (hmu * nseg  + 1): nrow
+      }else 
+        evaind <- (hmu * nseg  + 1): (nrow - hmu * nseg)
+      
+      # Deal with years with no data
+      if( all(is.na(df.i$y))) {
+        df.i $ smoothed <- rep(NA, nrow)
+      } else{
+      resMu <- locfit(y ~ lp(1:nrow,  deg = 3, h = hmu ), df.i , kern  = "epan", ev = 1:nrow)
+      df.i $ smoothed <- predict(resMu)
+      }
+      
+      df.i <- df.i[evaind,]
+      
+      # store the smoothed data
+      smoothed <- rbind(smoothed, df.i)
+      eval(parse(text = paste0("dfs.",loc, ".",ticker,".", i," <- df.i") ))
+      cat(i, "-th segment has been smoothed.\n")
+    }
+    
+  eval(parse(text = paste0("dfs.",loc, ".",ticker," <- smoothed") ))
+  }
+}    
+
+compare <- dfs.Davis.SPREAD [c("y", "smoothed")] # %>% na.omit()# [1:ndays,]
+matplot(compare%>% na.omit(), type = "l" , main = "Original data VS smoothed data of Davis Daily Maximum temperature")
+matplot(compare[1:ndays,], type = "l" , main = "Original data VS smoothed data of Davis Daily SPREAD in 1893")
+
+# save the workspace
+# save.image("pre-smooth-DavisRedwood")
+load("pre-smooth-DavisRedwood") 
+
+
+```
+
+Remark: special attention should be paid to the smoothed curve here. Although the smoothing enables us to estimate a complete curve for a certain year when partial data is missing, we should not use the complete curve, since interpolation can give extreme data.
+
+
+```{r, oneProcess}
+for(ticker in tickerlist){
+  for(loc in loclist){
+    eval(parse(text   = paste0("df <- dfs.",loc, ".",ticker)))
+    df <- df[!is.na(df$y), ]
+    resMu <- locfit(smoothed ~ lp(t, deg=1, h=hmu), df, ev=lfgrid(mg=ngrid)) 
+    tGrid <- seq(min(df$t), max(df$t), length.out=ngrid)  # working grid
+    samp.s <- MakeFPCAInputs(df$id, df$t, df$smoothed) 
+    res.s <- FPCA(samp.s$Ly, samp.s$Lt, list(userBwMu=hmu, userBwCov=hmu, FVEthreshold=1, dataType  = 'Dense')) 
+    eval(parse(text   = paste0("dfs.",loc, ".",ticker, ".res <- res.s")))
+  }
+
+}
+```
+
+
+
+````{r}
+# par(mfrow = c(1,3))
+
+for( ticker in tickerlist){
+    for( loc in loclist){
+        eval(parse(text = paste0("res.s <- dfs.",loc, ".",ticker,".res") ))
+      
+        ## Compare Covariance Matrix
+        cov.s = res.s$fittedCov
+        persp(x =1:ndays , y = 1:ndays,  z = cov.s)
+        plotdf.s <-list(x1 =1:ndays , x2 = 1:ndays,  cov = cov.s)
+
+        #### widgets
+        # p.s <- plot_ly(z = ~plotdf.s$cov, x=~plotdf.s$x1,  y=~plotdf.s$x2) %>% add_surface(text =c( "s",  "t",  "cov(s,t)"))
+        # p.s  <- layout(p.s,              
+                    # title = paste0("Covariance estimation for ", loc, ticker),
+                    # scene = list(xaxis = list(title = 't'),
+                    #     yaxis = list(title = 's'),
+                    #     zaxis = list(title = 'cov(t,s)', range = c(-1,8))))
+        # eval(parse(text   = paste0("p.s.",loc, ".",ticker, "<- p.s")))
+        # orca(p.s, paste0("p.s.",loc, ".",ticker, ".png"))
+        # htmlwidgets::saveWidget(p.s, paste0("p.s.",loc, ".",ticker, ".html"))
+        
+        #### 2d-heatmap
+        # png(file = paste0("p.s.",loc, ".",ticker, ".cov.png") ,width = 2000, height = 1000, units = "px", pointsize = 30)
+        p.s <- plot_ly(z = ~plotdf.s$cov, x=~plotdf.s$x1,  y=~plotdf.s$x2, type = "heatmap", colorbar = list(title = "cov(t,s)") )
+        p.s  <- layout(p.s,              
+                    title = paste0("Covariance estimation for ", loc, ticker),
+                    xaxis = list(title = "t"),
+                    yaxis = list(title = "s")
+                    )
+        p.s
+        # orca(p.s, file = paste0("p.s.",loc, ".",ticker, ".cov.png") )
+        # dev.off()
+    }
+}
+
+## FPC1 Comparison (phi1)
+# png("fpc1.png",width = 2000, height = 1000, units = "px", pointsize = 30)
+par(mfrow = c(1,3))
+for( ticker in tickerlist){
+    for( loc in loclist){
+        eval(parse(text = paste0("res.s <- dfs.",loc, ".",ticker,".res") ))
+        cov.s = res.s$fittedCov
+        plotdf.s <-list(x1 =1:ndays , x2 = 1:ndays,  cov = cov.s)
+    if(loc == loclist[1])
+      plot(1:ndays, res.s$phi[,1], col = 1, lwd = 2, lty = 1,ylim = c(-.01, .1), type = "l",xlab = "days", ylab = paste0("First PFC", ticker))  # main = paste0("The smoothed estimation of Mean Daily ", ticker)
+      else
+      lines(1:ndays,res.s$phi[,1], col = 2, lwd = 2, lty = 2, ylim = c(-.01, .1), xlab = "days")
+    }
+  legend("topleft",loclist, lty = 1:length(loclist) , lwd = 2 , col = 1:2)
+  
+}
+dev.off()
+
+
+## FPC2 Comparison (phi2)
+# png("fpc2.png",width = 2000, height = 1000, units = "px", pointsize = 30)
+par(mfrow = c(1,3))
+for( ticker in tickerlist){
+    for( loc in loclist){
+        eval(parse(text = paste0("res.s <- dfs.",loc, ".",ticker,".res") ))
+        cov.s = res.s$fittedCov
+        plotdf.s <-list(x1 =1:ndays , x2 = 1:ndays,  cov = cov.s)
+    if(loc == loclist[1])
+      plot(1:ndays, res.s$phi[,2], col = 1, lwd = 2, lty = 1,ylim = c(-.15, .15), type = "l",xlab = "days", ylab = paste0("Second PFC", ticker))  # main = paste0("The smoothed estimation of Mean Daily ", ticker)
+      else
+      lines(1:ndays,res.s$phi[,2], col = 2, lwd = 2, lty = 2, ylim = c(-.15, .15), xlab = "days")
+    }
+  legend("topleft",loclist, lty = 1:length(loclist) , lwd = 2 , col = 1:2)
+}
+dev.off()
+
+
+## FPC1 scores (xi1)
+png("xi1.png",width = 2000, height = 1000, units = "px", pointsize = 30)
+par(mfrow = c(1,3))
+t.res <- c()
+power.res <- c()
+for( ticker in tickerlist){
+    for( loc in loclist){
+        eval(parse(text = paste0("res.s <- dfs.",loc, ".",ticker,".res") ))
+        xi.s <- res.s$xiEst
+        years <- as.vector(as.numeric(names(res.s$inputData$Lt)))
+        if(loc == loclist[1]){
+           plot(years, xi.s[,1], col = 1, lwd = 2, lty = 1, type = "p",xlab = "years", ylab = paste0("xi1", ticker))  # main = paste0("The smoothed estimation of Mean Daily ", ticker)
+        reg1 <- (lm(xi.s[,1] ~ years))
+        abline(reg1$coefficients, col = 1, lwd = 2, lty = 1, ylim = c(-.01, .1), xlab = "days")
+        }else{
+          points(years, xi.s[,1], col = 2, lwd = 2, lty = 2)  # main = paste0("The smoothed estimation of Mean Daily ", ticker)
+          reg2 <- (lm(xi.s[,1] ~ years))
+          abline(reg2$coefficients, col = 2, lwd = 2, lty = 2, ylim = c(-.01, .1), xlab = "years")
+        }
+        
+    }
+  ## Store the t-statistics and powers
+  t.res <- cbind(t.res, c(summary(reg1)$coeff[2,3],summary(reg2)$coeff[2,3]))
+  power.res <- cbind(power.res, c(summary(reg1)$coeff[2,4],summary(reg2)$coeff[2,4]))
+  legend("topleft",loclist, lty = 1:length(loclist) , lwd = 2 , col = 1:2)
+  
+}
+
+
+dev.off()
+
+t.res
+power.res
+
+# matplot (res.s$phi[,1:3], type = "l", main = "First 3 PCs with Pre-smoothing")
+# plot(res.s$cumFVE, type = "l", xlab = "Number of PCs" , ylab ="Variance explained", main = paste0("Covariance estimation for ", loc, ticker))
+
+   
+    
+    
+
+```
+
+
+
+
+
+```{r, twoProcess }
+## Covariance & FPCs Estimation
+hmu  <- 49
+ngrid <- 365
+col <- 1: length(loclist)
+ylim <- c(0,40) 
+## Dataframe stacking
+#### Note the time for y_2 is shifted, otherwise error of duplicate time t would occur
+#### Also note the shift in time t would not affect the estimation of mean function, covariance function or eigen function. 
+#### It would only affect the FPC scores.
+df1 <- dfs.Redwood.TMIN.VALUE 
+df2 <- dfs.Redwood.TMAX.VALUE 
+plot(df1$smoothed,type = "l")
+plot(df1[!is.na(df1$y), ]$smoothed, type = "l") # interpolation can give extreme data
+
+df2$t <- df2$t+ndays
+dfs.min.max <- rbind(df1, df2)
+dfs.min.max$logt <- log(dfs.min.max$t) 
+df <- dfs.min.max [!is.na(dfs.min.max $y), ]
+plot(df$y, type = "l")
+plot(df$smoothed, type = "l")
+```
+
+
+```{r}
+resMu <- locfit(smoothed ~ lp(t, deg=1, h=hmu), df, ev=lfgrid(mg=ngrid)) 
+tGrid <- seq(min(df$t), max(df$t), length.out=ngrid)  # working grid
+samp.s <- MakeFPCAInputs(df$id, df$t, df$smoothed) 
+res.s <- FPCA(samp.s$Ly, samp.s$Lt, list(userBwMu=hmu, userBwCov=hmu, FVEthreshold=1, dataType  = 'Dense')) 
+matplot (res.s$phi[,1:3], type = "l", main = "First 3 PCs with Pre-smoothing")
+plot(res.s$cumFVE, type = "l", xlab = "Number of PCs" , ylab ="Variance explained", main = "Variance explained with Pre-smoothing")
+
+## Covariance between min and max
+x1 =1:ndays
+x2 = (ndays+1):(2*ndays)
+cov.s = res.s$fittedCov[x1,x2]
+persp(x =1:ndays , y = 1:ndays,  z = cov.s)
+plotdf.s <-list(x1 =1:ndays , x2 = 1:ndays,  cov = res.s$fittedCov[x1,x2])
+p.s <- plot_ly(z = ~plotdf.s$cov, x=~plotdf.s$x1,  y=~plotdf.s$x2) %>% add_surface( ylab = "s",  zlab ="beta1", theta = -30, phi = 30)
+p.s
+
+```
+
+
+
+## Functional Variance Process
+
+In this report, `functional variance process` (FVP) is introduced to extract the information in the stochastic time-trends in the noise variance of functional data.
+
+Consider $Y_1, \ldots, Y_n$ to be $n$ continuous smooth random functions defined over a real interval $[0,T]$, Here we also assume that these functions are observed at a grid of dense time-points $t_j = \frac{j-1}{m-1} T, j = 1, \ldots, n$ with measurements \[Y_{ij} = Y_i (t_j) + R_{ij}, \quad i = 1, \ldots, n , \quad j = 1, \ldots, m,\]
+where $R_{ij}$ are additive noises such that $E(R_{ij} R_{i'j}) = 0$ for $i \neq i'$ and $E(R) = 0$ and  $E(R^2) <\infty$. Also we model the noise into two parts: $V(t_{ij})$ from the underlying smooth functional variance process, $W(t_{ij})$ is a noise component. We also assume these two component satisfies \[R_{ij}^2 = \exp(V(t_{ij}) \exp(W(t_{ij}) \]
+Perform change of variables, we have
+\[Z_{ij}  : = \log(R_{ij}^2)  = V(t_{ij} + W(t_{ij} \]
+\[E(Z_{ij})  = E(V(t_{ij}) =: \mu_V(t_{ij}) \]
+\[Cov(Z_{ij},Z_{i'j})  =Cov(V(t_{ij}),V(t_{i'j})) \]
+
+Further assume mean and autocovariance of $V(t)$ as follows
+\[E(V(t))= \mu_V (t) \]
+\[C_{VV} (s,t)  = \sum_{k = 1}^\infty \rho_k \Psi_k(s ) \Psi_k(t)\]
+where $\rho_1\geq \rho_2 \geq \ldots, 0$ are non-negative ordered eigen values, $\Psi_k$ being the corresponding orthonormal eigen functions of $V$.
+
+
+
+
+
